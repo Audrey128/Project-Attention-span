@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attention Tracker</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --card: #fff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e4e2dc;
+    --good: #2f8f5b; --bad: #c8463d; --warn: #c98a1a; --accent: #3554d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --card: #1f1f1d; --ink: #ecebe6; --muted: #9a9890; --line: #33322f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .video-wrap { position: relative; aspect-ratio: 4 / 3; background: #000; border-radius: 10px; overflow: hidden; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  .overlay-msg { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 17px; text-align: center; padding: 20px; background: rgba(0,0,0,.45); }
+  .hidden { display: none !important; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 8px 14px; border-radius: 8px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  label.toggle { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); margin-left: auto; }
+  .status { font-size: 28px; font-weight: 650; margin: 2px 0 6px; }
+  .status.focused { color: var(--good); } .status.away { color: var(--bad); } .status.idle { color: var(--muted); } .status.calib { color: var(--warn); }
+  .reason { color: var(--muted); min-height: 1.4em; }
+  .score { font-size: 56px; font-weight: 700; letter-spacing: -1px; margin: 12px 0 0; font-variant-numeric: tabular-nums; }
+  .bar { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 6px 0 14px; }
+  .bar > div { height: 100%; width: 0; background: var(--good); transition: width .3s; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; font-variant-numeric: tabular-nums; }
+  .stats dt { color: var(--muted); font-size: 13px; } .stats dd { margin: 0 0 6px; font-weight: 600; }
+  table.raw { width: 100%; border-collapse: collapse; margin-top: 14px; font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  table.raw th, table.raw td { text-align: right; padding: 3px 6px; border-bottom: 1px solid var(--line); }
+  table.raw th:first-child, table.raw td:first-child { text-align: left; }
+  td.off { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Attention Tracker</h1>
+  <p class="sub">Runs entirely on this computer. No video leaves your browser.</p>
+
+  <div class="grid">
+    <section class="card">
+      <div class="video-wrap">
+        <video id="video" playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <div id="msg" class="overlay-msg">Press <b>&nbsp;Start camera&nbsp;</b> to begin</div>
+      </div>
+      <div class="controls">
+        <button id="startBtn" class="primary">Start camera</button>
+        <button id="recalBtn" disabled>Recalibrate</button>
+        <button id="resetBtn" disabled>Reset score</button>
+        <label class="toggle"><input type="checkbox" id="rawToggle"> Show raw numbers</label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div id="status" class="status idle">Idle</div>
+      <div id="reason" class="reason"></div>
+      <div id="score" class="score">--%</div>
+      <div class="bar"><div id="scoreBar"></div></div>
+      <dl class="stats">
+        <div><dt>Focused</dt><dd id="focusedTime">0:00</dd></div>
+        <div><dt>Distracted</dt><dd id="awayTime">0:00</dd></div>
+        <div><dt>Distractions</dt><dd id="awayCount">0</dd></div>
+        <div><dt>Current streak</dt><dd id="streak">0:00</dd></div>
+      </dl>
+      <table id="rawTable" class="raw hidden">
+        <thead><tr><th>signal</th><th>live</th><th>baseline</th><th>limit</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver, DrawingUtils } from "./vendor/vision_bundle.mjs";
+
+// ---------- Tuning: all thresholds live here ----------
+const CFG = {
+  calibMs: 2000,        // how long to record your "looking at the screen" baseline
+  gazeTol: 0.12,        // allowed iris shift (fraction of eye width) from baseline
+  yawTol: 0.10,         // allowed head turn (nose position between cheeks) from baseline
+  pitchTol: 0.07,       // allowed head tilt (nose position between forehead and chin) from baseline
+  blinkThresh: 0.55,    // eyeBlink blendshape above this = eyes closed
+  lookDownExtra: 0.25,  // eyeLookDown allowed above baseline before it counts as looking down
+  awayGraceMs: 1000,    // must stay away this long before it counts as distracted
+  smoothing: 0.35,      // 0..1, higher = more responsive, lower = smoother
+};
+
+// ---------- Landmark indices (MediaPipe 478-point face mesh) ----------
+const L = {
+  rEyeOuter: 33, rEyeInner: 133, rIris: 468,   // subject's right eye
+  lEyeInner: 362, lEyeOuter: 263, lIris: 473,  // subject's left eye
+  nose: 1, rCheek: 234, lCheek: 454, forehead: 10, chin: 152,
+};
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+
+let landmarker = null, drawer = null, running = false, lastVideoTime = -1;
+let baseline = null, calibSamples = [], calibStart = 0;
+let smooth = null;
+let awaySince = null, isAway = false, awayReason = "";
+let focusedMs = 0, awayMs = 0, awayCount = 0, streakStart = null, lastTick = null;
+
+// ---------- Feature extraction ----------
+function ratio(p, a, b, axis) {
+  const d = b[axis] - a[axis];
+  return Math.abs(d) < 1e-6 ? 0.5 : (p[axis] - a[axis]) / d;
+}
+
+function extract(lm, blend) {
+  const bs = {};
+  for (const c of blend?.categories ?? []) bs[c.categoryName] = c.score;
+
+  const gR = ratio(lm[L.rIris], lm[L.rEyeOuter], lm[L.rEyeInner], "x");
+  const gL = ratio(lm[L.lIris], lm[L.lEyeInner], lm[L.lEyeOuter], "x");
+  return {
+    gazeH: (gR + gL) / 2,
+    yaw: ratio(lm[L.nose], lm[L.rCheek], lm[L.lCheek], "x"),
+    pitch: ratio(lm[L.nose], lm[L.forehead], lm[L.chin], "y"),
+    blink: ((bs.eyeBlinkLeft ?? 0) + (bs.eyeBlinkRight ?? 0)) / 2,
+    down: ((bs.eyeLookDownLeft ?? 0) + (bs.eyeLookDownRight ?? 0)) / 2,
+  };
+}
+
+function smoothFeatures(f) {
+  if (!smooth) return (smooth = { ...f });
+  const a = CFG.smoothing;
+  for (const k in f) smooth[k] = smooth[k] + a * (f[k] - smooth[k]);
+  return smooth;
+}
+
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+// ---------- Classification ----------
+function checks(f) {
+  const b = baseline;
+  return {
+    gazeH: { off: Math.abs(f.gazeH - b.gazeH) > CFG.gazeTol, limit: `±${CFG.gazeTol}`, why: "Eyes looking away" },
+    yaw:   { off: Math.abs(f.yaw - b.yaw) > CFG.yawTol, limit: `±${CFG.yawTol}`, why: "Head turned away" },
+    pitch: { off: Math.abs(f.pitch - b.pitch) > CFG.pitchTol, limit: `±${CFG.pitchTol}`, why: f.pitch > b.pitch ? "Head tilted down" : "Head tilted up" },
+    blink: { off: f.blink > CFG.blinkThresh, limit: `<${CFG.blinkThresh}`, why: "Eyes closed" },
+    down:  { off: f.down - b.down > CFG.lookDownExtra, limit: `+${CFG.lookDownExtra}`, why: "Glancing down" },
+  };
+}
+
+// ---------- UI ----------
+const fmt = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+
+function setStatus(kind, text, reason = "") {
+  const el = $("status");
+  el.className = `status ${kind}`;
+  el.textContent = text;
+  $("reason").textContent = reason;
+}
+
+function renderStats(now) {
+  const total = focusedMs + awayMs;
+  const pct = total > 0 ? Math.round((focusedMs / total) * 100) : null;
+  $("score").textContent = pct === null ? "--%" : `${pct}%`;
+  $("scoreBar").style.width = `${pct ?? 0}%`;
+  $("scoreBar").style.background = pct === null || pct >= 75 ? "var(--good)" : pct >= 50 ? "var(--warn)" : "var(--bad)";
+  $("focusedTime").textContent = fmt(focusedMs);
+  $("awayTime").textContent = fmt(awayMs);
+  $("awayCount").textContent = awayCount;
+  $("streak").textContent = streakStart ? fmt(now - streakStart) : "0:00";
+}
+
+function renderRaw(f, c) {
+  if (!$("rawToggle").checked) return;
+  const rows = Object.keys(f).map((k) => {
+    const base = baseline ? baseline[k].toFixed(3) : "—";
+    const off = c?.[k]?.off;
+    return `<tr><td>${k}</td><td class="${off ? "off" : ""}">${f[k].toFixed(3)}</td><td>${base}</td><td>${c?.[k]?.limit ?? "—"}</td></tr>`;
+  });
+  $("rawTable").querySelector("tbody").innerHTML = rows.join("");
+}
+
+function drawLandmarks(lm, away) {
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!lm) return;
+  const color = away ? "#ff5a4e" : "#4ade80";
+  drawer.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS, { color, lineWidth: 2 });
+  drawer.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS, { color, lineWidth: 2 });
+  drawer.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, { color: "#ffffffaa", lineWidth: 1 });
+  drawer.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, { color: "#ffffffaa", lineWidth: 1 });
+  drawer.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, { color: "#ffffff55", lineWidth: 1 });
+}
+
+// ---------- Main loop ----------
+function tick() {
+  if (!running) return;
+  requestAnimationFrame(tick);
+  if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+
+  const now = performance.now();
+  const res = landmarker.detectForVideo(video, now);
+  const lm = res.faceLandmarks?.[0];
+  let rawAway = false, reason = "";
+  let f = null, c = null;
+
+  if (!lm) {
+    smooth = null;
+    rawAway = true;
+    reason = "No face detected";
+  } else {
+    f = smoothFeatures(extract(lm, res.faceBlendshapes?.[0]));
+  }
+
+  // Calibration phase
+  if (!baseline) {
+    drawLandmarks(lm, false);
+    if (f) {
+      calibSamples.push({ ...f });
+      const left = Math.max(0, CFG.calibMs - (now - calibStart));
+      setStatus("calib", "Calibrating…", `Look at the screen normally (${(left / 1000).toFixed(1)}s)`);
+      if (now - calibStart >= CFG.calibMs && calibSamples.length >= 10) {
+        baseline = {};
+        for (const k of Object.keys(f)) baseline[k] = median(calibSamples.map((s) => s[k]));
+        lastTick = now;
+        streakStart = now;
+      }
+    } else {
+      calibStart = now;
+      calibSamples = [];
+      setStatus("calib", "Calibrating…", "Center your face in the camera");
+    }
+    if (f) renderRaw(f, null);
+    return;
+  }
+
+  if (f) {
+    c = checks(f);
+    const hit = Object.values(c).find((x) => x.off);
+    if (hit) { rawAway = true; reason = hit.why; }
+  }
+  if (document.hidden) { rawAway = true; reason = "Switched tabs"; }
+
+  // Grace period: only count as away after awayGraceMs
+  if (rawAway) {
+    awaySince ??= now;
+    if (!isAway && now - awaySince >= CFG.awayGraceMs) {
+      isAway = true;
+      awayCount++;
+      streakStart = null;
+    }
+    awayReason = reason;
+  } else {
+    awaySince = null;
+    if (isAway) { isAway = false; streakStart = now; }
+  }
+
+  const dt = Math.min(now - lastTick, 1000);
+  lastTick = now;
+  if (isAway) awayMs += dt; else focusedMs += dt;
+
+  if (isAway) setStatus("away", "Distracted", awayReason);
+  else setStatus("focused", "Focused", rawAway ? `${reason}…` : "");
+
+  drawLandmarks(lm, isAway);
+  if (f) renderRaw(f, c);
+  renderStats(now);
+}
+
+// Tab switches: the loop pauses in hidden tabs, so account for that time directly.
+let hiddenAt = null;
+document.addEventListener("visibilitychange", () => {
+  if (!running || !baseline) return;
+  const now = performance.now();
+  if (document.hidden) {
+    hiddenAt = now;
+  } else if (hiddenAt !== null) {
+    awayMs += now - hiddenAt;
+    if (!isAway) awayCount++;
+    isAway = false;
+    awaySince = null;
+    streakStart = now;
+    lastTick = now;
+    hiddenAt = null;
+    renderStats(now);
+  }
+});
+
+function startCalibration() {
+  baseline = null;
+  calibSamples = [];
+  calibStart = performance.now();
+  smooth = null;
+}
+
+function resetScore() {
+  focusedMs = awayMs = awayCount = 0;
+  isAway = false;
+  awaySince = null;
+  streakStart = baseline ? performance.now() : null;
+  renderStats(performance.now());
+}
+
+async function init() {
+  $("msg").textContent = "Loading face model…";
+  const fileset = await FilesetResolver.forVisionTasks("./vendor/wasm");
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: "./models/face_landmarker.task", delegate },
+    runningMode: "VIDEO",
+    numFaces: 1,
+    outputFaceBlendshapes: true,
+  });
+  try {
+    landmarker = await FaceLandmarker.createFromOptions(fileset, opts("GPU"));
+  } catch {
+    landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU"));
+  }
+  drawer = new DrawingUtils(ctx);
+}
+
+$("startBtn").addEventListener("click", async () => {
+  const btn = $("startBtn");
+  if (running) {
+    running = false;
+    video.srcObject?.getTracks().forEach((t) => t.stop());
+    video.srcObject = null;
+    btn.textContent = "Start camera";
+    $("recalBtn").disabled = $("resetBtn").disabled = true;
+    $("msg").classList.remove("hidden");
+    $("msg").textContent = "Camera stopped";
+    setStatus("idle", "Idle");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  btn.disabled = true;
+  try {
+    if (!landmarker) await init();
+    $("msg").textContent = "Waiting for camera permission…";
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+      audio: false,
+    });
+    await video.play();
+    $("msg").classList.add("hidden");
+    running = true;
+    btn.textContent = "Stop camera";
+    $("recalBtn").disabled = $("resetBtn").disabled = false;
+    resetScore();
+    startCalibration();
+    requestAnimationFrame(tick);
+  } catch (err) {
+    console.error(err);
+    $("msg").classList.remove("hidden");
+    $("msg").textContent = err.name === "NotAllowedError"
+      ? "Camera access was blocked. Allow it in your browser's site settings and try again."
+      : `Couldn't start: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("recalBtn").addEventListener("click", () => { resetScore(); startCalibration(); });
+$("resetBtn").addEventListener("click", resetScore);
+$("rawToggle").addEventListener("change", (e) => $("rawTable").classList.toggle("hidden", !e.target.checked));
+</script>
+</body>
+</html>
